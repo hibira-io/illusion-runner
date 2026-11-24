@@ -1,0 +1,309 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+env:
+  # The engine we ship. Bump SD_CPP_REF in a PR to update it.
+  SD_CPP_REPO: leejet/stable-diffusion.cpp
+  SD_CPP_REF: 79dc7ca9074d79419a46380cdb95a4524db9b74c # master-1127-79dc7ca
+  NODE_VERSION: "24"
+  PNPM_VERSION: "10.15.1"
+
+jobs:
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      - id: v
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            echo "version=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=dev-${GITHUB_SHA:0:7}" >> "$GITHUB_OUTPUT"
+          fi
+
+  macos:
+    needs: version
+    runs-on: macos-15
+    timeout-minutes: 60
+    env:
+      RUNNER_VERSION: ${{ needs.version.outputs.version }}
+      PACKAGE: illusion-runner-${{ needs.version.outputs.version }}-macos-arm64-metal
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Checkout stable-diffusion.cpp
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ env.SD_CPP_REPO }}
+          ref: ${{ env.SD_CPP_REF }}
+          path: sd
+          submodules: recursive
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - uses: pnpm/action-setup@v5
+        with:
+          version: ${{ env.PNPM_VERSION }}
+
+      - name: Build
+        run: |
+          # Static build: sd-cli and sd-server are self-contained, Metal shaders embedded.
+          cmake -S sd -B sd/build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_OSX_ARCHITECTURES=arm64 \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=14.0 \
+            -DSD_METAL=ON
+          cmake --build sd/build --config Release -j "$(sysctl -n hw.ncpu)"
+          ls -la sd/build/bin
+
+      - name: Code sign (when Apple secrets are configured)
+        env:
+          APPLE_CERT_P12_BASE64: ${{ secrets.APPLE_CERT_P12_BASE64 }}
+          APPLE_CERT_PASSWORD: ${{ secrets.APPLE_CERT_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+        run: |
+          if [ -z "$APPLE_CERT_P12_BASE64" ]; then
+            echo "::notice::Apple signing secrets not set; macOS build is unsigned."
+            exit 0
+          fi
+          keychain="$RUNNER_TEMP/signing.keychain-db"
+          kc_pass=$(openssl rand -hex 16)
+          echo "$APPLE_CERT_P12_BASE64" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security create-keychain -p "$kc_pass" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$kc_pass" "$keychain"
+          security import "$RUNNER_TEMP/cert.p12" -k "$keychain" -P "$APPLE_CERT_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple: -k "$kc_pass" "$keychain"
+          security list-keychains -d user -s "$keychain" $(security list-keychains -d user | tr -d '"')
+          rm "$RUNNER_TEMP/cert.p12"
+          find sd/build/bin -type f \( -perm -u+x -o -name '*.dylib' \) -print0 |
+            xargs -0 codesign --force --options runtime --timestamp --sign "$APPLE_SIGNING_IDENTITY"
+          codesign --verify --verbose sd/build/bin/sd-cli
+
+      - name: Package
+        run: scripts/package.sh sd/build/bin sd "$PACKAGE" metal
+
+      - name: Notarize (when Apple secrets are configured)
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          if [ -z "$APPLE_ID" ]; then
+            echo "::notice::Apple notarization secrets not set; skipping."
+            exit 0
+          fi
+          xcrun notarytool submit "dist/$PACKAGE.zip" \
+            --apple-id "$APPLE_ID" --password "$APPLE_APP_PASSWORD" --team-id "$APPLE_TEAM_ID" --wait
+
+      - uses: actions/upload-artifact@v6
+        with:
+          name: ${{ env.PACKAGE }}
+          path: dist/${{ env.PACKAGE }}.zip
+          if-no-files-found: error
+
+  linux:
+    needs: version
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - backend: cpu
+            defines: ""
+          - backend: vulkan
+            defines: "-DSD_VULKAN=ON"
+    env:
+      RUNNER_VERSION: ${{ needs.version.outputs.version }}
+      PACKAGE: illusion-runner-${{ needs.version.outputs.version }}-linux-x64-${{ matrix.backend }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Checkout stable-diffusion.cpp
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ env.SD_CPP_REPO }}
+          ref: ${{ env.SD_CPP_REF }}
+          path: sd
+          submodules: recursive
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - uses: pnpm/action-setup@v5
+        with:
+          version: ${{ env.PNPM_VERSION }}
+
+      - name: Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential zip
+          if [ "${{ matrix.backend }}" = vulkan ]; then
+            sudo apt-get install -y libvulkan-dev glslc spirv-headers
+          fi
+
+      - name: Build
+        run: |
+          cmake -S sd -B sd/build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DSD_BUILD_SHARED_LIBS=ON -DSD_BUILD_SHARED_GGML_LIB=ON \
+            -DGGML_NATIVE=OFF -DGGML_BACKEND_DL=ON -DGGML_CPU_ALL_VARIANTS=ON \
+            -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON -DCMAKE_INSTALL_RPATH='$ORIGIN' \
+            ${{ matrix.defines }}
+          cmake --build sd/build --config Release -j "$(nproc)"
+          ls -la sd/build/bin
+
+      - name: Package
+        run: scripts/package.sh sd/build/bin sd "$PACKAGE" "${{ matrix.backend }}"
+
+      - uses: actions/upload-artifact@v6
+        with:
+          name: ${{ env.PACKAGE }}
+          path: dist/${{ env.PACKAGE }}.zip
+          if-no-files-found: error
+
+  windows:
+    needs: version
+    runs-on: windows-2022
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - backend: cpu
+            defines: ""
+          - backend: vulkan
+            defines: "-DSD_VULKAN=ON"
+    env:
+      RUNNER_VERSION: ${{ needs.version.outputs.version }}
+      PACKAGE: illusion-runner-${{ needs.version.outputs.version }}-windows-x64-${{ matrix.backend }}
+      VULKAN_VERSION: 1.4.328.1
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Checkout stable-diffusion.cpp
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ env.SD_CPP_REPO }}
+          ref: ${{ env.SD_CPP_REF }}
+          path: sd
+          submodules: recursive
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - uses: pnpm/action-setup@v5
+        with:
+          version: ${{ env.PNPM_VERSION }}
+
+      - name: Install Vulkan SDK
+        if: matrix.backend == 'vulkan'
+        shell: pwsh
+        run: |
+          curl.exe -o $env:RUNNER_TEMP/VulkanSDK-Installer.exe -L "https://sdk.lunarg.com/sdk/download/${env:VULKAN_VERSION}/windows/vulkansdk-windows-X64-${env:VULKAN_VERSION}.exe"
+          & "$env:RUNNER_TEMP\VulkanSDK-Installer.exe" --accept-licenses --default-answer --confirm-command install
+          Add-Content $env:GITHUB_ENV "VULKAN_SDK=C:\VulkanSDK\${env:VULKAN_VERSION}"
+          Add-Content $env:GITHUB_PATH "C:\VulkanSDK\${env:VULKAN_VERSION}\bin"
+
+      - name: Build
+        shell: pwsh
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vsPath = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if (-not $vsPath) { throw "Visual Studio C++ tools not found" }
+          & "$vsPath\Common7\Tools\Launch-VsDevShell.ps1" -Arch amd64 -HostArch amd64 -SkipAutomaticLocation
+
+          cmake -S sd -B sd/build -G Ninja `
+            -DCMAKE_C_COMPILER=cl.exe -DCMAKE_CXX_COMPILER=cl.exe -DCMAKE_CXX_FLAGS='/bigobj' `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DSD_BUILD_SHARED_LIBS=ON -DSD_BUILD_SHARED_GGML_LIB=ON `
+            -DGGML_NATIVE=OFF -DGGML_BACKEND_DL=ON -DGGML_CPU_ALL_VARIANTS=ON `
+            ${{ matrix.defines }}
+          if ($LASTEXITCODE -ne 0) { throw "cmake configure failed" }
+          cmake --build sd/build
+          if ($LASTEXITCODE -ne 0) { throw "cmake build failed" }
+          Get-ChildItem sd/build/bin
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $stage = "stage/$env:PACKAGE"
+          New-Item -ItemType Directory -Force "$stage/licenses", dist | Out-Null
+          Copy-Item sd/build/bin/* $stage -Recurse
+          Copy-Item sd/start-server.sh, sd/start-server.bat $stage
+          Copy-Item sd/LICENSE "$stage/licenses/stable-diffusion.cpp.txt"
+          Copy-Item sd/ggml/LICENSE "$stage/licenses/ggml.txt"
+          Copy-Item sd/thirdparty/libwebp/COPYING "$stage/licenses/libwebp.txt"
+          Copy-Item sd/thirdparty/libwebm/LICENSE.TXT "$stage/licenses/libwebm.txt"
+          Copy-Item LICENSE "$stage/licenses/illusion-runner.txt"
+          Copy-Item README.md "$stage/README.md"
+          $sdSha = git -C sd rev-parse HEAD
+          $built = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+          @(
+            "illusion-runner $env:RUNNER_VERSION",
+            "backend ${{ matrix.backend }}",
+            "stable-diffusion.cpp $sdSha",
+            "built $built"
+          ) | Set-Content "$stage/VERSION.txt"
+
+          # Smoke test from the staged folder so a missing DLL fails the build.
+          Push-Location $stage
+          ./sd-cli.exe --version
+          if ($LASTEXITCODE -ne 0) { throw "sd-cli --version failed" }
+          Pop-Location
+
+          7z a "dist/$env:PACKAGE.zip" "./stage/$env:PACKAGE"
+          if ($LASTEXITCODE -ne 0) { throw "7z failed" }
+
+      - uses: actions/upload-artifact@v6
+        with:
+          name: ${{ env.PACKAGE }}
+          path: dist/${{ env.PACKAGE }}.zip
+          if-no-files-found: error
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [version, macos, linux, windows]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v7
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Checksums
+        run: |
+          cd dist
+          sha256sum *.zip > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          flags=""
+          if [[ "$TAG" == *-* ]]; then flags="--prerelease"; fi
+          gh release create "$TAG" dist/*.zip dist/SHA256SUMS.txt \
+            --repo "$GITHUB_REPOSITORY" --title "$TAG" --generate-notes $flags
