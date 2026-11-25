@@ -26,6 +26,7 @@ cp "$sd_dir/ggml/LICENSE" "$stage/licenses/ggml.txt"
 cp "$sd_dir/thirdparty/libwebp/COPYING" "$stage/licenses/libwebp.txt"
 cp "$sd_dir/thirdparty/libwebm/LICENSE.TXT" "$stage/licenses/libwebm.txt"
 cp "$root/LICENSE" "$stage/licenses/illusion-runner.txt"
+cp "$root/NOTICE" "$stage/NOTICE"
 cp "$root/README.md" "$stage/README.md"
 
 sd_sha=$(git -C "$sd_dir" rev-parse HEAD)
@@ -38,7 +39,7 @@ EOF
 
 # Smoke test from the staged folder, not the build tree, so missing
 # libraries or absolute rpaths fail here instead of on a customer's machine.
-(cd "$stage" && ./sd-cli --version)
+(cd "$stage" && ./sd-cli --version && ./illusion-runner version)
 
 (cd "$root/stage" && zip -qry "$root/dist/$name.zip" "$name")
 echo "Packaged dist/$name.zip"

@@ -35,6 +35,45 @@ jobs:
             echo "version=dev-${GITHUB_SHA:0:7}" >> "$GITHUB_OUTPUT"
           fi
 
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-15, windows-2022]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - name: gofmt
+        if: runner.os == 'Linux'
+        run: test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }
+      - run: go vet ./...
+      - run: go test ./...
+      - name: Race detector
+        if: runner.os == 'Linux'
+        run: go test -race ./...
+
+  # The runner alone, for every platform: for people who run their own engine
+  # (ComfyUI, or their own sd-cli build) and platforms without a bundle yet.
+  runner:
+    needs: [version, test]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - run: scripts/build.sh "${{ needs.version.outputs.version }}"
+      - uses: actions/upload-artifact@v6
+        with:
+          name: illusion-runner-${{ needs.version.outputs.version }}-runner-only
+          path: dist/*.zip
+          if-no-files-found: error
+
   macos:
     needs: version
     runs-on: macos-15
@@ -52,6 +91,10 @@ jobs:
           ref: ${{ env.SD_CPP_REF }}
           path: sd
           submodules: recursive
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
 
       - uses: actions/setup-node@v5
         with:
@@ -71,6 +114,11 @@ jobs:
             -DSD_METAL=ON
           cmake --build sd/build --config Release -j "$(sysctl -n hw.ncpu)"
           ls -la sd/build/bin
+
+      - name: Build the runner
+        run: |
+          CGO_ENABLED=0 go build -trimpath -ldflags "-s -w -X main.version=$RUNNER_VERSION" \
+            -o sd/build/bin/illusion-runner ./cmd/illusion-runner
 
       - name: Code sign (when Apple secrets are configured)
         env:
@@ -144,6 +192,10 @@ jobs:
           path: sd
           submodules: recursive
 
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
       - uses: actions/setup-node@v5
         with:
           node-version: ${{ env.NODE_VERSION }}
@@ -170,6 +222,11 @@ jobs:
             ${{ matrix.defines }}
           cmake --build sd/build --config Release -j "$(nproc)"
           ls -la sd/build/bin
+
+      - name: Build the runner
+        run: |
+          CGO_ENABLED=0 go build -trimpath -ldflags "-s -w -X main.version=$RUNNER_VERSION" \
+            -o sd/build/bin/illusion-runner ./cmd/illusion-runner
 
       - name: Package
         run: scripts/package.sh sd/build/bin sd "$PACKAGE" "${{ matrix.backend }}"
@@ -207,6 +264,10 @@ jobs:
           path: sd
           submodules: recursive
 
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
       - uses: actions/setup-node@v5
         with:
           node-version: ${{ env.NODE_VERSION }}
@@ -243,6 +304,13 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "cmake build failed" }
           Get-ChildItem sd/build/bin
 
+      - name: Build the runner
+        shell: pwsh
+        run: |
+          $env:CGO_ENABLED = "0"
+          go build -trimpath -ldflags "-s -w -X main.version=$env:RUNNER_VERSION" -o sd/build/bin/illusion-runner.exe ./cmd/illusion-runner
+          if ($LASTEXITCODE -ne 0) { throw "go build failed" }
+
       - name: Package
         shell: pwsh
         run: |
@@ -255,6 +323,7 @@ jobs:
           Copy-Item sd/thirdparty/libwebp/COPYING "$stage/licenses/libwebp.txt"
           Copy-Item sd/thirdparty/libwebm/LICENSE.TXT "$stage/licenses/libwebm.txt"
           Copy-Item LICENSE "$stage/licenses/illusion-runner.txt"
+          Copy-Item NOTICE "$stage/NOTICE"
           Copy-Item README.md "$stage/README.md"
           $sdSha = git -C sd rev-parse HEAD
           $built = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
@@ -269,6 +338,8 @@ jobs:
           Push-Location $stage
           ./sd-cli.exe --version
           if ($LASTEXITCODE -ne 0) { throw "sd-cli --version failed" }
+          ./illusion-runner.exe version
+          if ($LASTEXITCODE -ne 0) { throw "illusion-runner version failed" }
           Pop-Location
 
           7z a "dist/$env:PACKAGE.zip" "./stage/$env:PACKAGE"
@@ -282,7 +353,7 @@ jobs:
 
   release:
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [version, macos, linux, windows]
+    needs: [version, test, runner, macos, linux, windows]
     runs-on: ubuntu-latest
     permissions:
       contents: write
