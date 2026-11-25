@@ -1,0 +1,15 @@
+Illusion runner
+Copyright 2026 Hibira
+
+This product is licensed under the Apache License, Version 2.0 (LICENSE).
+
+"Illusion", "Hibira Illusion" and "Hibira" are trademarks of Hibira. The
+Apache License does not grant permission to use them: a fork must use another
+name and must not suggest it is made or endorsed by Hibira.
+
+The runner can drive these separately installed programs, each under its own
+licence and not distributed in this repository:
+  ComfyUI             GPL-3.0     https://github.com/comfyanonymous/ComfyUI
+  stable-diffusion.cpp MIT        https://github.com/leejet/stable-diffusion.cpp
+Model weights are downloaded from their publishers under their own licences
+(Apache-2.0, CreativeML Open RAIL++-M for SDXL, BSD-3-Clause for Real-ESRGAN).
