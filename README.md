@@ -159,6 +159,10 @@ git tag v0.1.0
 git push origin v0.1.0
 ```
 
+Or, without a checkout: on GitHub open **Releases → Draft a new release**,
+type a new tag (for example `v0.1.0`), target `main`, and publish. That makes
+the tag; the build then adds the downloads to that release (about 30 minutes).
+
 Tags with a hyphen (for example `v0.2.0-rc.1`) are published as pre-releases.
 Pushes to `main` and pull requests run the tests and the same builds and attach the zips as
 workflow artifacts (Actions tab → run → Artifacts) without creating a release.
