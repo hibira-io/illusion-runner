@@ -374,7 +374,13 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.ref_name }}
         run: |
-          flags=""
-          if [[ "$TAG" == *-* ]]; then flags="--prerelease"; fi
-          gh release create "$TAG" dist/*.zip dist/SHA256SUMS.txt \
-            --repo "$GITHUB_REPOSITORY" --title "$TAG" --generate-notes $flags
+          # A release made on GitHub's Releases page (which also makes the tag)
+          # already exists: add the downloads to it. Otherwise create it.
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/*.zip dist/SHA256SUMS.txt --repo "$GITHUB_REPOSITORY" --clobber
+          else
+            flags=""
+            if [[ "$TAG" == *-* ]]; then flags="--prerelease"; fi
+            gh release create "$TAG" dist/*.zip dist/SHA256SUMS.txt \
+              --repo "$GITHUB_REPOSITORY" --title "$TAG" --generate-notes $flags
+          fi
